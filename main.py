@@ -1,6 +1,5 @@
-"""
-TrajOOD 最小可行实验
-DeiT-Small + 单点轨迹 + CIFAR-10 vs OOD
+"""TrajOOD 连续轨迹方案
+DeiT-Small + 12层连续信号(L2+余弦相似度+马氏距离) + CIFAR-10 vs OOD
 一键运行: python main.py
 """
 
@@ -17,23 +16,23 @@ from models.act_branch import ACTBranch
 from trajectory.extractor import TrajectoryExtractor, TrajectoryStatistics
 from trainers.finetune import finetune
 from trainers.train_act import train_act_branch
-from evaluation.scoring import compute_energy_scores, compute_traj_scores, fuse_scores
+from evaluation.scoring import compute_energy_scores, compute_traj_scores, compute_fused_scores
 from evaluation.metrics import compute_all_metrics
 
 
 def set_seed(seed):
     # 1. Python 内置随机数生成器
     random.seed(seed)
-    
+
     # 2. NumPy 随机数生成器
     np.random.seed(seed)
-    
+
     # 3. PyTorch CPU 随机数生成器
     torch.manual_seed(seed)
-    
+
     # 4. PyTorch GPU 随机数生成器（所有GPU）
     torch.cuda.manual_seed_all(seed)
-    
+
     # 5. cuDNN 确定性模式（保证卷积结果可重复）
     torch.backends.cudnn.deterministic = True
 
@@ -43,7 +42,7 @@ def main():
     device = cfg.DEVICE
     print(f"Device: {device}")
 
-    # ============ Step 1: 数据加载============
+    # ============ Step 1: 数据加载 ============
     print("\n[Step 1] 加载数据集...")
     train_loader, test_loader = get_cifar10_loaders(
         cfg.DATA_ROOT, cfg.BATCH_SIZE, cfg.NUM_WORKERS
@@ -90,21 +89,48 @@ def main():
     print(f"  Hook层: {cfg.TRAJ_LAYERS}")
 
     # ============ Step 5: 提取训练集轨迹 ============
-    print("\n[Step 5] 提取训练集轨迹向量...")
-    # 1. 提取每个类别每层的最大值，及索引
-    print("\n[Step 5.1] 提取训练集轨迹")
+    print("\n[Step 5] 提取训练集轨迹...")
+
+    # 5.1 提取逐层特征和L2范数
+    print("  [5.1] 提取逐层CLS特征和L2范数...")
     traj_extractor = TrajectoryExtractor(model, hook, device)
-    traj_val, traj_idx, labels = traj_extractor.extract_dataset(train_loader)
-    print(f"  轨迹形状: {traj_val.shape}")  # [S, LayersNum]
-    print(f"  轨迹示例: {traj_val[0]}")
-    # 2. 拟合统计量
-    print("\n[Step 5.2] 拟合统计量")
-    traj_stats = TrajectoryStatistics(num_classes=10, n_layers=len(hook.layer_indices))
-    traj_stats.fit(traj_idx, labels)
-    traj_stats.save('checkpoints/traj_stats.pt')
-    
+    l2_trajectories, labels, all_features = traj_extractor.extract_dataset(train_loader)
+    print(f"  L2轨迹形状: {l2_trajectories.shape}")  # [N, 12]
+
+    # 5.2 拟合类级统计量（均值+协方差逆）
+    print("  [5.2] 拟合类级统计量...")
+    traj_stats = TrajectoryStatistics(
+        num_classes=cfg.NUM_CLASSES,
+        n_layers=len(cfg.TRAJ_LAYERS)
+    )
+    traj_stats.fit(
+        all_features, labels, cfg.TRAJ_LAYERS,
+        shrinkage=cfg.SHRINKAGE
+    )
+    traj_stats.save(os.path.join(cfg.SAVE_DIR, "traj_stats.pt"))
+
+    # 5.3 构建完整36维轨迹（需要预测标签）
+    print("  [5.3] 构建完整轨迹向量...")
+    # 训练集用真实标签作为pred_labels
+    # 需要逐batch重建features_dict来计算余弦和马氏
+    all_traj = []
+    offset = 0
+    for batch_feat in all_features:
+        B = batch_feat[cfg.TRAJ_LAYERS[0]].shape[0]
+        batch_labels = labels[offset:offset + B]
+        batch_l2 = l2_trajectories[offset:offset + B]
+        traj = traj_stats.build_trajectory(
+            batch_feat, batch_labels, batch_l2, cfg.TRAJ_LAYERS
+        )
+        all_traj.append(traj)
+        offset += B
+    full_trajectories = torch.cat(all_traj, dim=0)  # [N, 36]
+    print(f"  完整轨迹形状: {full_trajectories.shape}")
+    print(f"  轨迹示例(前3维): {full_trajectories[0, :3]}")
+
+    # 构建ACT训练用DataLoader
     traj_train_loader = traj_extractor.make_traj_loader(
-        traj_val, labels, batch_size=256, shuffle=True
+        full_trajectories, labels, batch_size=256, shuffle=True
     )
 
     # ============ Step 6: 训练ACT-Branch ============
@@ -136,15 +162,19 @@ def main():
     print("=" * 70)
     print(f"{'OOD数据集':<12} {'方法':<15} {'AUROC':>8} {'FPR@95':>8} {'AUPR':>8}")
     print("=" * 70)
-    traj_stats = TrajectoryStatistics.load('checkpoints/traj_stats.pt')
+
+    # 重新加载统计量（验证save/load一致性）
+    traj_stats = TrajectoryStatistics.load(
+        os.path.join(cfg.SAVE_DIR, "traj_stats.pt")
+    )
+
     # ID测试集分数
     id_energy = compute_energy_scores(model, test_loader, device)
     id_traj = compute_traj_scores(
         act_model, model, hook, traj_extractor, traj_stats,
-        test_loader, device,
-        weight_energy=0.4, weight_deviation=0.3, weight_aligned=0.3
+        test_loader, device
     )
-    id_fused = fuse_scores(id_energy, id_traj, cfg.FUSION_LAMBDA)
+    id_fused = compute_fused_scores(id_energy, id_traj, cfg.FUSION_LAMBDA)
 
     for ood_name in ["svhn", "textures", "lsun"]:
         ood_loader = get_ood_loader(
@@ -161,14 +191,13 @@ def main():
         # 轨迹分数
         ood_traj = compute_traj_scores(
             act_model, model, hook, traj_extractor, traj_stats,
-            ood_loader, device,
-            weight_energy=0.4, weight_deviation=0.3, weight_aligned=0.3
+            ood_loader, device
         )
         m2 = compute_all_metrics(id_traj.numpy(), ood_traj.numpy())
         print(f"{'':<12} {'Trajectory':<15} {m2['auroc']:>7.2f}% {m2['fpr95']:>7.2f}% {m2['aupr']:>7.2f}%")
 
         # 融合分数
-        ood_fused = fuse_scores(ood_energy, ood_traj, cfg.FUSION_LAMBDA)
+        ood_fused = compute_fused_scores(ood_energy, ood_traj, cfg.FUSION_LAMBDA)
         m3 = compute_all_metrics(id_fused.numpy(), ood_fused.numpy())
         print(f"{'':<12} {'Fusion':<15} {m3['auroc']:>7.2f}% {m3['fpr95']:>7.2f}% {m3['aupr']:>7.2f}%")
         print("-" * 70)

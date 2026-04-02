@@ -1,6 +1,8 @@
-"""
-ACT-Branch: 激活轨迹判别模型
+"""ACT-Branch: 激活轨迹判别模型
 2层MLP + LogitNorm
+
+输入: 36维连续轨迹向量 (12层 x 3信号)
+输出: num_classes维logits
 """
 
 import torch
@@ -22,30 +24,29 @@ class LogitNormLoss(nn.Module):
 
 
 class ACTBranch(nn.Module):
+    """轨迹判别网络
+
+    结构: Linear -> ReLU -> Dropout -> Linear
+    训练时用LogitNorm损失
+    推理时用energy score (logsumexp)
     """
-    轻量级全连接网络
-    输入: 单点轨迹向量 [B, traj_dim]
-    输出: logits [B, num_classes]
-    """
-    def __init__(self, traj_dim, hidden_dim=64, num_classes=10):
+    def __init__(self, traj_dim=36, hidden_dim=64, num_classes=10):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(traj_dim, hidden_dim),
             nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_dim, num_classes)
         )
 
     def forward(self, x):
         return self.net(x)
 
-    def get_score(self, x):
-        """
-        推理时获取OOD分数
-        使用负Energy score: -logsumexp(logits)
-        ID样本分数应该更高（负energy更大）
+    @torch.no_grad()
+    def get_energy(self, x):
+        """推理时计算energy score
+        Energy = logsumexp(logits)
+        ID样本energy高, OOD样本energy低
         """
         logits = self.forward(x)
-        energy = torch.logsumexp(logits, dim=1)
-        return energy# ID高，OOD低
+        return torch.logsumexp(logits, dim=1)

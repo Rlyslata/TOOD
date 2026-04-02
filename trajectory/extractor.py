@@ -1,228 +1,247 @@
-"""
-单点轨迹提取器
+"""连续轨迹提取器
 训练阶段：
-    1. 提取所有ID样本的 traj_val 和 traj_idx
-    2. 按类别统计每层的典型索引（众数）→ class_typical_idx[c] shape [n_layers]
-    3. 同时需要保存每层特征（用于B方案按索引取值）
+    1. 提取所有ID样本的逐层CLS特征
+    2. 计算每层L2范数 -> [N, 12]
+    3. 按类别统计每层均值向量和共享协方差矩阵
+    4. 计算余弦相似度和马氏距离 -> 拼接为 [N, 36] 轨迹
 评估阶段：
     对每个测试/OOD样本：
-    1. 前向传播得到预测类别 c_pred、每层特征、traj_val、traj_idx
-    2. 信号A：索引偏离度 — traj_idx 与 class_typical_idx[c_pred] 逐层比较，不匹配的层数越多 → 越OOD
-    3. 信号B：用 class_typical_idx[c_pred] 的索引位置去每层特征取值，得到 aligned_val，值越低→ 越OOD
-    4. 综合A、B得到最终Trajectory分数
+    1. 前向传播得到预测类别和逐层特征
+    2. 计算L2范数 + 余弦相似度 + 马氏距离 -> [B, 36]
+    3. 送入ACT-Branch得到energy分数
 """
 import torch
 import torch.nn as nn
 from torch.utils.data import TensorDataset, DataLoader
-from collections import Counter
 import numpy as np
 
 
-# ============================================================
-# 1. TrajectoryExtractor (改进版)
-# ============================================================
 class TrajectoryExtractor:
+    """提取逐层CLS token特征并计算连续轨迹信号"""
+
     def __init__(self, model, hook, device):
+        """
+        Args:
+            model: DeiTBackbone实例
+            hook: TransformerHook实例
+            device: torch.device
+        """
         self.model = model
         self.hook = hook
         self.device = device
-
-    def extract_single_point(self, features_dict):
-        """
-        每层CLS token取最大值 + 最大值索引
-        Args:
-            features_dict: {layer_idx: [B, D]}
-        Returns:
-            traj_val: [B, n_layers]  最大值
-            traj_idx: [B, n_layers]  最大值索引
-        """
-        val_points = []
-        idx_points = []
-        for layer_idx in sorted(features_dict.keys()):
-            feat = features_dict[layer_idx]  # [B, D]
-            max_result = feat.max(dim=1)
-            val_points.append(max_result.values)   # [B]
-            idx_points.append(max_result.indices)   # [B]
-        traj_val = torch.stack(val_points, dim=1)  # [B, n_layers]
-        traj_idx = torch.stack(idx_points, dim=1)  # [B, n_layers]
-        return traj_val, traj_idx
-
-    def extract_aligned_values(self, features_dict, target_indices):
-        """
-        信号B: 用指定索引位置去每层特征取值
-        Args:
-            features_dict: {layer_idx: [B, D]}
-            target_indices: [B, n_layers] 每层要取的维度索引
-        Returns:
-            aligned_val: [B, n_layers]
-        """
-        aligned_points = []
-        for i, layer_idx in enumerate(sorted(features_dict.keys())):
-            feat = features_dict[layer_idx]  # [B, D]
-            idx = target_indices[:, i]        # [B]
-            # 用gather按索引取值
-            val = feat.gather(1, idx.unsqueeze(1)).squeeze(1)  # [B]
-            aligned_points.append(val)
-        aligned_val = torch.stack(aligned_points, dim=1)  # [B, n_layers]
-        return aligned_val
+        self.layer_indices = hook.layer_indices
 
     @torch.no_grad()
     def extract_dataset(self, dataloader):
         """
-        对整个数据集提取轨迹
+        提取整个数据集的逐层特征和L2范数轨迹
+
+        Args:
+            dataloader: DataLoader
+
         Returns:
-            all_traj_val: [N, n_layers]
-            all_traj_idx: [N, n_layers]
-            all_labels:   [N]
+            l2_trajectories: [N, n_layers] 每层CLS的L2范数
+            labels: [N] 标签
+            all_features: list of dict, 每个dict是 {layer_idx: [B, feat_dim]}
+                          用于后续拟合统计量
         """
         self.model.eval()
-        all_traj_val = []
-        all_traj_idx = []
+        all_l2 = []
         all_labels = []
+        all_features = []  # 存储每个batch的features_dict（CPU）
 
         for x, y in dataloader:
             x = x.to(self.device)
-            self.hook.clear()
-            logits, _ = self.model(x)
+            self.model(x)  # forward触发hook
+            features_dict = self.hook.get_features()  # {layer_idx: [B, 384]}
 
-            features_dict = self.hook.get_features()
-            traj_val, traj_idx = self.extract_single_point(features_dict)
+            # 计算每层L2范数
+            batch_l2 = []
+            batch_feat = {}
+            for layer in self.layer_indices:
+                feat = features_dict[layer]  # [B, 384]
+                l2 = torch.norm(feat, p=2, dim=1)  # [B]
+                batch_l2.append(l2)
+                batch_feat[layer] = feat.cpu()  # 转CPU节省显存
 
-            all_traj_val.append(traj_val.cpu())
-            all_traj_idx.append(traj_idx.cpu())
+            batch_l2 = torch.stack(batch_l2, dim=1)  # [B, n_layers]
+            all_l2.append(batch_l2.cpu())
             all_labels.append(y)
+            all_features.append(batch_feat)
 
-        all_traj_val = torch.cat(all_traj_val, dim=0)
-        all_traj_idx = torch.cat(all_traj_idx, dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
-        return all_traj_val, all_traj_idx, all_labels
+        l2_trajectories = torch.cat(all_l2, dim=0)  # [N, n_layers]
+        labels = torch.cat(all_labels, dim=0)  # [N]
 
-    def make_traj_loader(self, trajs, labels, batch_size, shuffle=True):
-        dataset = TensorDataset(trajs, labels)
+        return l2_trajectories, labels, all_features
+
+    def make_traj_loader(self, trajectories, labels, batch_size=256, shuffle=True):
+        """
+        将轨迹数据打包为DataLoader
+
+        Args:
+            trajectories: [N, traj_dim] 完整轨迹向量
+            labels: [N] 标签
+            batch_size: batch大小
+            shuffle: 是否打乱
+
+        Returns:
+            DataLoader
+        """
+        dataset = TensorDataset(trajectories, labels)
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
 
 
-# ============================================================
-# 2. TrajectoryStatistics (新增)
-#    训练阶段统计每个类别每层的典型索引
-# ============================================================
 class TrajectoryStatistics:
+    """管理训练集的类级统计量（均值、协方差逆），用于计算余弦相似度和马氏距离"""
+
     def __init__(self, num_classes, n_layers):
+        """
+        Args:
+            num_classes: 类别数
+            n_layers: hook的层数
+        """
         self.num_classes = num_classes
         self.n_layers = n_layers
-        # 每个类别每层的典型索引 (众数)
-        self.typical_idx = None  # [num_classes, n_layers]
-        # 每个类别每层的索引分布 (用于计算概率)
-        self.idx_distributions = None
+        self.class_means = {}   # {class_id: {layer_idx: [feat_dim]}}
+        self.shared_cov_inv = {}  # {layer_idx: [feat_dim, feat_dim]}
 
-    def fit(self, traj_idx, labels):
+    def fit(self, all_features, labels, layer_indices, shrinkage=0.1):
         """
-        统计每个类别每层的典型索引
+        从训练集特征计算每类每层的均值向量和共享协方差矩阵的逆
+
         Args:
-            traj_idx: [N, n_layers] 所有ID样本的最大值索引
-            labels:   [N] 对应标签
+            all_features: list of dict, 每个dict是 {layer_idx: [B, feat_dim]}（来自extract_dataset）
+            labels: [N] 所有样本的标签
+            layer_indices: 层索引列表
+            shrinkage: 协方差矩阵正则化系数
         """
-        self.typical_idx = torch.zeros(self.num_classes, self.n_layers, dtype=torch.long)
-        # 保存每类每层的索引频率分布, 用于信号A的概率打分
-        self.idx_distributions = {}
+        # 先按层拼接所有batch的特征
+        layer_feats = {}  # {layer_idx: [N, feat_dim]}
+        for layer in layer_indices:
+            chunks = [batch_dict[layer] for batch_dict in all_features]
+            layer_feats[layer] = torch.cat(chunks, dim=0)  # [N, feat_dim]
 
+        feat_dim = layer_feats[layer_indices[0]].shape[1]
+
+        # 按类计算每层均值
         for c in range(self.num_classes):
             mask = (labels == c)
-            class_idx = traj_idx[mask]  # [Nc, n_layers]
+            self.class_means[c] = {}
+            for layer in layer_indices:
+                class_feat = layer_feats[layer][mask]  # [Nc, feat_dim]
+                self.class_means[c][layer] = class_feat.mean(dim=0)  # [feat_dim]
 
-            if class_idx.shape[0] == 0:
-                continue
+        # 按层计算共享协方差矩阵的逆（所有类共享）
+        for layer in layer_indices:
+            feats = layer_feats[layer]  # [N, feat_dim]
+            mean = feats.mean(dim=0, keepdim=True)  # [1, feat_dim]
+            centered = feats - mean  # [N, feat_dim]
+            cov = (centered.T @ centered) / (feats.shape[0] - 1)  # [feat_dim, feat_dim]
+            # shrinkage正则化防止奇异
+            cov = cov + shrinkage * torch.eye(feat_dim)
+            self.shared_cov_inv[layer] = torch.linalg.inv(cov)  # [feat_dim, feat_dim]
 
-            self.idx_distributions[c] = {}
+        print(f"  统计量拟合完成: {self.num_classes}类, {len(layer_indices)}层, 特征维度{feat_dim}")
 
-            for layer in range(self.n_layers):
-                layer_indices = class_idx[:, layer].numpy()
-                counter = Counter(layer_indices)
-                # 众数作为典型索引
-                mode_idx = counter.most_common(1)[0][0]
-                self.typical_idx[c, layer] = mode_idx
-                # 保存频率分布
-                total = len(layer_indices)
-                self.idx_distributions[c][layer] = {
-                    int(k): v / total for k, v in counter.items()
-                }
-
-        print(f"[TrajectoryStatistics] 拟合完成, {self.num_classes}类, {self.n_layers}层")
-        return self
-
-    def compute_index_deviation(self, traj_idx, pred_labels):
+    def compute_cosine_sim(self, features_dict, pred_labels, layer_indices):
         """
-        信号A: 计算索引偏离度
-        索引与预测类别的典型索引不匹配的层数比例
+        计算每个样本与其预测类均值的余弦相似度
+
         Args:
-            traj_idx:    [B, n_layers]
-            pred_labels: [B] 模型预测的类别
-        Returns:
-            deviation: [B]  范围[0,1], 越大越可能OOD
-        """
-        B = traj_idx.shape[0]
-        typical = self.typical_idx[pred_labels]  # [B, n_layers]
-        # 逐层比较: 不匹配为1, 匹配为0
-        mismatch = (traj_idx != typical).float()  # [B, n_layers]
-        # 不匹配层数比例
-        deviation = mismatch.mean(dim=1)  # [B]
-        return deviation
+            features_dict: {layer_idx: [B, feat_dim]}
+            pred_labels: [B] 预测标签
+            layer_indices: 层索引列表
 
-    def compute_index_probability(self, traj_idx, pred_labels):
+        Returns:
+            cos_sim: [B, n_layers]
         """
-        信号A增强版: 基于概率的索引偏离
-        用每层索引在该类别分布中的概率, 概率越低越异常
+        B = pred_labels.shape[0]
+        n_layers = len(layer_indices)
+        cos_sim = torch.zeros(B, n_layers)
+
+        for i, layer in enumerate(layer_indices):
+            feat = features_dict[layer]  # [B, feat_dim]
+            if feat.is_cuda:
+                feat = feat.cpu()
+            for j in range(B):
+                c = pred_labels[j].item()
+                mean = self.class_means[c][layer]  # [feat_dim]
+                sim = torch.nn.functional.cosine_similarity(
+                    feat[j].unsqueeze(0), mean.unsqueeze(0)
+                )  # [1]
+                cos_sim[j, i] = sim.item()
+
+        return cos_sim  # [B, n_layers]
+
+    def compute_mahalanobis(self, features_dict, pred_labels, layer_indices):
+        """
+        计算每个样本到其预测类中心的马氏距离
+
         Args:
-            traj_idx:    [B, n_layers]
-            pred_labels: [B]
+            features_dict: {layer_idx: [B, feat_dim]}
+            pred_labels: [B] 预测标签
+            layer_indices: 层索引列表
+
         Returns:
-            neg_log_prob: [B]  负对数概率, 越大越可能OOD
+            mahal: [B, n_layers]
         """
-        B = traj_idx.shape[0]
-        log_probs = torch.zeros(B)
-        smoothing = 1e-4  # 未见过的索引给一个小概率
+        B = pred_labels.shape[0]
+        n_layers = len(layer_indices)
+        mahal = torch.zeros(B, n_layers)
 
-        for i in range(B):
-            c = pred_labels[i].item()
-            total_log_p = 0.0
-            for layer in range(self.n_layers):
-                idx_val = traj_idx[i, layer].item()
-                if c in self.idx_distributions and layer in self.idx_distributions[c]:
-                    p = self.idx_distributions[c][layer].get(idx_val, smoothing)
-                else:
-                    p = smoothing
-                total_log_p += np.log(p)
-            log_probs[i] = total_log_p
+        for i, layer in enumerate(layer_indices):
+            feat = features_dict[layer]  # [B, feat_dim]
+            if feat.is_cuda:
+                feat = feat.cpu()
+            cov_inv = self.shared_cov_inv[layer]  # [feat_dim, feat_dim]
 
-        # 返回负对数概率: ID样本概率高 -> neg_log_prob低
-        #                  OOD样本概率低 -> neg_log_prob高
-        neg_log_prob = -log_probs
-        return neg_log_prob
+            for j in range(B):
+                c = pred_labels[j].item()
+                mean = self.class_means[c][layer]  # [feat_dim]
+                diff = (feat[j] - mean).unsqueeze(0)  # [1, feat_dim]
+                # 马氏距离: sqrt(diff @ cov_inv @ diff^T)
+                m = torch.sqrt(diff @ cov_inv @ diff.T + 1e-8)  # [1, 1]
+                mahal[j, i] = m.item()
 
-    def get_typical_indices(self, pred_labels):
+        return mahal  # [B, n_layers]
+
+    def build_trajectory(self, features_dict, pred_labels, l2_norms, layer_indices):
         """
-        获取预测类别对应的典型索引
+        拼接完整的36维轨迹向量: [L2, cos_sim, mahalanobis] x 12层
+
         Args:
-            pred_labels: [B]
+            features_dict: {layer_idx: [B, feat_dim]}
+            pred_labels: [B] 预测标签
+            l2_norms: [B, n_layers] L2范数
+            layer_indices: 层索引列表
+
         Returns:
-            typical: [B, n_layers]
+            trajectory: [B, n_layers * 3]
         """
-        return self.typical_idx[pred_labels]
+        cos_sim = self.compute_cosine_sim(features_dict, pred_labels, layer_indices)
+        mahal = self.compute_mahalanobis(features_dict, pred_labels, layer_indices)
+
+        # 拼接: [B, n_layers] x 3 -> [B, n_layers * 3]
+        trajectory = torch.cat([l2_norms, cos_sim, mahal], dim=1)
+        return trajectory
 
     def save(self, path):
-        torch.save({
-            'typical_idx': self.typical_idx,
-            'idx_distributions': self.idx_distributions,
+        """保存统计量到文件"""
+        state = {
             'num_classes': self.num_classes,
             'n_layers': self.n_layers,
-        }, path)
-        print(f"[TrajectoryStatistics] 已保存到 {path}")
+            'class_means': self.class_means,
+            'shared_cov_inv': self.shared_cov_inv,
+        }
+        torch.save(state, path)
+        print(f"  统计量已保存: {path}")
 
     @classmethod
     def load(cls, path):
-        data = torch.load(path, weights_only=False)
-        obj = cls(data['num_classes'], data['n_layers'])
-        obj.typical_idx = data['typical_idx']
-        obj.idx_distributions = data['idx_distributions']
-        print(f"[TrajectoryStatistics] 已加载 {path}")
+        """从文件加载统计量"""
+        state = torch.load(path, map_location='cpu')
+        obj = cls(state['num_classes'], state['n_layers'])
+        obj.class_means = state['class_means']
+        obj.shared_cov_inv = state['shared_cov_inv']
+        print(f"  统计量已加载: {path}")
         return obj
