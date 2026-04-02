@@ -112,7 +112,6 @@ def main():
     # 5.3 构建完整36维轨迹（需要预测标签）
     print("  [5.3] 构建完整轨迹向量...")
     # 训练集用真实标签作为pred_labels
-    # 需要逐batch重建features_dict来计算余弦和马氏
     all_traj = []
     offset = 0
     for batch_feat in all_features:
@@ -171,10 +170,9 @@ def main():
     # ID测试集分数
     id_energy = compute_energy_scores(model, test_loader, device)
     id_traj = compute_traj_scores(
-        act_model, model, hook, traj_extractor, traj_stats,
-        test_loader, device
+        act_model, model, hook, traj_stats,
+        test_loader, device, cfg.TRAJ_LAYERS
     )
-    id_fused = compute_fused_scores(id_energy, id_traj, cfg.FUSION_LAMBDA)
 
     for ood_name in ["svhn", "textures", "lsun"]:
         ood_loader = get_ood_loader(
@@ -190,16 +188,19 @@ def main():
 
         # 轨迹分数
         ood_traj = compute_traj_scores(
-            act_model, model, hook, traj_extractor, traj_stats,
-            ood_loader, device
+            act_model, model, hook, traj_stats,
+            ood_loader, device, cfg.TRAJ_LAYERS
         )
         m2 = compute_all_metrics(id_traj.numpy(), ood_traj.numpy())
-        print(f"{'':<12} {'Trajectory':<15} {m2['auroc']:>7.2f}% {m2['fpr95']:>7.2f}% {m2['aupr']:>7.2f}%")
+        print(f"{'':.<12} {'Trajectory':<15} {m2['auroc']:>7.2f}% {m2['fpr95']:>7.2f}% {m2['aupr']:>7.2f}%")
 
-        # 融合分数
-        ood_fused = compute_fused_scores(ood_energy, ood_traj, cfg.FUSION_LAMBDA)
+        # 融合分数（ID+OOD联合归一化）
+        id_fused, ood_fused = compute_fused_scores(
+            id_energy, id_traj, ood_energy, ood_traj,
+            alpha=cfg.FUSION_LAMBDA, beta=1.0 - cfg.FUSION_LAMBDA
+        )
         m3 = compute_all_metrics(id_fused.numpy(), ood_fused.numpy())
-        print(f"{'':<12} {'Fusion':<15} {m3['auroc']:>7.2f}% {m3['fpr95']:>7.2f}% {m3['aupr']:>7.2f}%")
+        print(f"{'':.<12} {'Fusion':<15} {m3['auroc']:>7.2f}% {m3['fpr95']:>7.2f}% {m3['aupr']:>7.2f}%")
         print("-" * 70)
 
     # 清理hook

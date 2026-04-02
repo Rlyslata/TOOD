@@ -1,5 +1,4 @@
-"""
-DeiT-Small backbone + 可微调分类头
+"""DeiT-Small backbone + 可微调分类头
 使用timm加载预训练权重，冻结backbone，微调分类头
 """
 
@@ -15,7 +14,7 @@ class DeiTBackbone(nn.Module):
         self.backbone = timm.create_model(
             "deit_small_patch16_224",
             pretrained=True,
-            num_classes=0# 去掉原始分类头
+            num_classes=0  # 去掉原始分类头
         )
         self.feat_dim = self.backbone.embed_dim  # 384
 
@@ -25,7 +24,7 @@ class DeiTBackbone(nn.Module):
         # 冻结backbone
         if freeze_backbone:
             for param in self.backbone.parameters():
-                param.r1equires_grad = False
+                param.requires_grad = False
 
     def forward(self, x):
         """
