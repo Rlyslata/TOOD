@@ -42,7 +42,7 @@ def main():
     device = cfg.DEVICE
     print(f"Device: {device}")
 
-    # ============ Step 1: 数据加载 ============
+    # =========== Step 1: 数据加载 ===========
     print("\n[Step 1] 加载数据集...")
     train_loader, test_loader = get_cifar10_loaders(
         cfg.DATA_ROOT, cfg.BATCH_SIZE, cfg.NUM_WORKERS
@@ -50,13 +50,13 @@ def main():
     print(f"  CIFAR-10 训练集: {len(train_loader.dataset)} 样本")
     print(f"  CIFAR-10 测试集: {len(test_loader.dataset)} 样本")
 
-    # ============ Step 2: 加载DeiT-Small ============
+    # =========== Step 2: 加载DeiT-Small ===========
     print("\n[Step 2] 加载DeiT-Small预训练模型...")
     model = DeiTBackbone(num_classes=cfg.NUM_CLASSES, freeze_backbone=True)
     model.to(device)
     print(f"  特征维度: {model.feat_dim}")
 
-    # ============ Step 3: 微调分类头 ============
+    # =========== Step 3: 微调分类头 ===========
     print("\n[Step 3] 微调分类头...")
     ckpt_path = os.path.join(cfg.SAVE_DIR, "deit_cifar10.pth")
     if os.path.exists(ckpt_path):
@@ -83,12 +83,12 @@ def main():
             total += y.size(0)
     print(f"  CIFAR-10 测试准确率: {correct/total * 100:.2f}%")
 
-    # ============ Step 4: 注册Hook ============
+    # =========== Step 4: 注册Hook ===========
     print("\n[Step 4] 注册Transformer层Hook...")
     hook = TransformerHook(model, cfg.TRAJ_LAYERS)
     print(f"  Hook层: {cfg.TRAJ_LAYERS}")
 
-    # ============ Step 5: 提取训练集轨迹 ============
+    # =========== Step 5: 提取训练集轨迹 ===========
     print("\n[Step 5] 提取训练集轨迹...")
 
     # 5.1 提取逐层特征和L2范数
@@ -132,7 +132,7 @@ def main():
         full_trajectories, labels, batch_size=256, shuffle=True
     )
 
-    # ============ Step 6: 训练ACT-Branch ============
+    # =========== Step 6: 训练ACT-Branch ===========
     print("\n[Step 6] 训练ACT-Branch...")
     act_ckpt_path = os.path.join(cfg.SAVE_DIR, "act_branch.pth")
     act_model = ACTBranch(
@@ -156,8 +156,10 @@ def main():
         torch.save(act_model.state_dict(), act_ckpt_path)
         print(f"  模型已保存: {act_ckpt_path}")
 
-    # ============ Step 7: OOD评估 ============
+    # =========== Step 7: OOD评估 ===========
     print("\n[Step 7] OOD评估...")
+    fusion_mode = cfg.FUSION_MODE
+    print(f"  融合模式: {fusion_mode}")
     print("=" * 70)
     print(f"{'OOD数据集':<12} {'方法':<15} {'AUROC':>8} {'FPR@95':>8} {'AUPR':>8}")
     print("=" * 70)
@@ -194,13 +196,15 @@ def main():
         m2 = compute_all_metrics(id_traj.numpy(), ood_traj.numpy())
         print(f"{'':.<12} {'Trajectory':<15} {m2['auroc']:>7.2f}% {m2['fpr95']:>7.2f}% {m2['aupr']:>7.2f}%")
 
-        # 融合分数（ID+OOD联合归一化）
+        # 融合分数
         id_fused, ood_fused = compute_fused_scores(
             id_energy, id_traj, ood_energy, ood_traj,
-            alpha=cfg.FUSION_LAMBDA, beta=1.0 - cfg.FUSION_LAMBDA
+            alpha=cfg.FUSION_LAMBDA, beta=1.0 - cfg.FUSION_LAMBDA,
+            mode=fusion_mode
         )
         m3 = compute_all_metrics(id_fused.numpy(), ood_fused.numpy())
-        print(f"{'':.<12} {'Fusion':<15} {m3['auroc']:>7.2f}% {m3['fpr95']:>7.2f}% {m3['aupr']:>7.2f}%")
+        fusion_label = f"Fusion({fusion_mode})"
+        print(f"{'':.<12} {fusion_label:<15} {m3['auroc']:>7.2f}% {m3['fpr95']:>7.2f}% {m3['aupr']:>7.2f}%")
         print("-" * 70)
 
     # 清理hook

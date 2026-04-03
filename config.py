@@ -32,7 +32,7 @@ TRAJ_LAYERS = list(range(12))  # 全部12层
 FEAT_DIM = 384  # DeiT-Small hidden dim
 NUM_SIGNALS = 3  # L2范数, 余弦相似度, 马氏距离
 TRAJ_DIM = len(TRAJ_LAYERS) * NUM_SIGNALS  # 12 * 3 = 36
-SHRINKAGE = 0.0005  # 协方差矩阵正则化系数
+SHRINKAGE = 0.0001  # 协方差矩阵正则化系数
 
 # ============ ACT-Branch ============
 ACT_EPOCHS = 100         # 50 -> 100
@@ -43,3 +43,13 @@ LOGITNORM_TAU = 0.04
 
 # ============ 评分融合 ============
 FUSION_LAMBDA = 0.7  # energy与trajectory的融合权重
+
+# ============ 自适应融合 ============
+# 融合模式:
+#   "fixed"           - min-max归一化 + 固定权重 (原始方式)
+#   "zscore_max"      - 用ID分布z-score统一量纲后逐样本取min(保守策略)
+#   "zscore_weighted" - 用ID分布z-score统一量纲后按紧致度自动加权
+#   "zscore_adaptive" - 自适应选择更偏离的z-score
+#   "zscore_multiply" - 带符号乘法融合
+FUSION_MODE = "zscore_multiply"
+
