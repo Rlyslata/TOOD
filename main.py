@@ -20,7 +20,7 @@ import config_resnet as cfg
 
 # ============ 导入模块 ============
 from datasets.loader import get_cifar10_loaders, get_ood_loader
-from models.resnet_backbone import ResNet18Backbone
+from models.resnet_backbone import ResNetBackbone
 from models.resnet_hook import ResNetHook
 from models.act_branch import ACTBranch
 from trajectory.extractor_resnet import TrajectoryExtractor, TrajectoryStatistics
