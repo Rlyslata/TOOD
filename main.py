@@ -1,39 +1,40 @@
-"""TrajOOD 连续轨迹方案
-DeiT-Small + 12层连续信号(L2+余弦相似度+马氏距离) + CIFAR-10 vs OOD
-一键运行: python main.py
+"""TrajOOD - ResNet18版本
+ResNet18 + 4层连续信号(L2+余弦相似度+马氏距离) + CIFAR-10 vs OOD
+一键运行: python main_resnet.py
+
+与DeiT版本的核心区别:
+1. 4个ResNet layer替代12个Transformer block
+2. 各层特征维度不同(64/128/256/512)，需要独立处理协方差
+3. 轨迹维度: 4层 x 3信号 = 12维 (DeiT是36维)
+4. 输入尺寸224(使用ImageNet预训练权重)
 """
 
 import torch
 import random
 import numpy as np
 import os
+import sys
 
-import config as cfg
+# ============ 导入配置 ============
+import config_resnet as cfg
+
+# ============ 导入模块 ============
 from datasets.loader import get_cifar10_loaders, get_ood_loader
-from models.deit_backbone import DeiTBackbone
-from models.hook import TransformerHook
+from models.resnet_backbone import ResNet18Backbone
+from models.resnet_hook import ResNetHook
 from models.act_branch import ACTBranch
-from trajectory.extractor import TrajectoryExtractor, TrajectoryStatistics
-from trainers.finetune import finetune
+from trajectory.extractor_resnet import TrajectoryExtractor, TrajectoryStatistics
+from trainers.finetune_resnet import finetune
 from trainers.train_act import train_act_branch
-from evaluation.scoring import compute_energy_scores, compute_traj_scores, compute_fused_scores
+from evaluation.scoring import compute_energy_scores, compute_traj_scores_resnet
 from evaluation.metrics import compute_all_metrics
 
 
 def set_seed(seed):
-    # 1. Python 内置随机数生成器
     random.seed(seed)
-
-    # 2. NumPy 随机数生成器
     np.random.seed(seed)
-
-    # 3. PyTorch CPU 随机数生成器
     torch.manual_seed(seed)
-
-    # 4. PyTorch GPU 随机数生成器（所有GPU）
     torch.cuda.manual_seed_all(seed)
-
-    # 5. cuDNN 确定性模式（保证卷积结果可重复）
     torch.backends.cudnn.deterministic = True
 
 
@@ -41,6 +42,8 @@ def main():
     set_seed(cfg.SEED)
     device = cfg.DEVICE
     print(f"Device: {device}")
+    print(f"ResNet18 Trajectory OOD Detection")
+    print(f"轨迹维度: {cfg.TRAJ_DIM} (4层 x 3信号)")
 
     # =========== Step 1: 数据加载 ===========
     print("\n[Step 1] 加载数据集...")
@@ -50,15 +53,16 @@ def main():
     print(f"  CIFAR-10 训练集: {len(train_loader.dataset)} 样本")
     print(f"  CIFAR-10 测试集: {len(test_loader.dataset)} 样本")
 
-    # =========== Step 2: 加载DeiT-Small ===========
-    print("\n[Step 2] 加载DeiT-Small预训练模型...")
-    model = DeiTBackbone(num_classes=cfg.NUM_CLASSES, freeze_backbone=True)
+    # =========== Step 2: 加载ResNet18 ===========
+    print("\n[Step 2] 加载ResNet18预训练模型...")
+    model = ResNet18Backbone(num_classes=cfg.NUM_CLASSES, freeze_backbone=True)
     model.to(device)
     print(f"  特征维度: {model.feat_dim}")
+    print(f"  各层维度: {cfg.LAYER_DIMS}")
 
     # =========== Step 3: 微调分类头 ===========
     print("\n[Step 3] 微调分类头...")
-    ckpt_path = os.path.join(cfg.SAVE_DIR, "deit_cifar10.pth")
+    ckpt_path = os.path.join(cfg.SAVE_DIR, "resnet18_cifar10.pth")
     if os.path.exists(ckpt_path):
         print(f"  加载已有checkpoint: {ckpt_path}")
         model.load_state_dict(torch.load(ckpt_path, map_location=device))
@@ -84,34 +88,35 @@ def main():
     print(f"  CIFAR-10 测试准确率: {correct/total * 100:.2f}%")
 
     # =========== Step 4: 注册Hook ===========
-    print("\n[Step 4] 注册Transformer层Hook...")
-    hook = TransformerHook(model, cfg.TRAJ_LAYERS)
+    print("\n[Step 4] 注册ResNet层Hook...")
+    hook = ResNetHook(model, cfg.TRAJ_LAYERS)
     print(f"  Hook层: {cfg.TRAJ_LAYERS}")
+    print(f"  对应维度: {[cfg.LAYER_DIMS[i] for i in range(len(cfg.TRAJ_LAYERS))]}")
 
     # =========== Step 5: 提取训练集轨迹 ===========
     print("\n[Step 5] 提取训练集轨迹...")
 
     # 5.1 提取逐层特征和L2范数
-    print("  [5.1] 提取逐层CLS特征和L2范数...")
+    print("  [5.1] 提取逐层特征和L2范数...")
     traj_extractor = TrajectoryExtractor(model, hook, device)
     l2_trajectories, labels, all_features = traj_extractor.extract_dataset(train_loader)
-    print(f"  L2轨迹形状: {l2_trajectories.shape}")  # [N, 12]
+    print(f"  L2轨迹形状: {l2_trajectories.shape}")  # [N, 4]
 
     # 5.2 拟合类级统计量（均值+协方差逆）
     print("  [5.2] 拟合类级统计量...")
     traj_stats = TrajectoryStatistics(
         num_classes=cfg.NUM_CLASSES,
-        n_layers=len(cfg.TRAJ_LAYERS)
+        n_layers=len(cfg.TRAJ_LAYERS),
+        layer_dims=cfg.LAYER_DIMS
     )
     traj_stats.fit(
         all_features, labels, cfg.TRAJ_LAYERS,
         shrinkage=cfg.SHRINKAGE
     )
-    traj_stats.save(os.path.join(cfg.SAVE_DIR, "traj_stats.pt"))
+    traj_stats.save(os.path.join(cfg.SAVE_DIR, "traj_stats_resnet.pt"))
 
-    # 5.3 构建完整36维轨迹（需要预测标签）
+    # 5.3 构建完整12维轨迹
     print("  [5.3] 构建完整轨迹向量...")
-    # 训练集用真实标签作为pred_labels
     all_traj = []
     offset = 0
     for batch_feat in all_features:
@@ -123,9 +128,9 @@ def main():
         )
         all_traj.append(traj)
         offset += B
-    full_trajectories = torch.cat(all_traj, dim=0)  # [N, 36]
+    full_trajectories = torch.cat(all_traj, dim=0)  # [N, 12]
     print(f"  完整轨迹形状: {full_trajectories.shape}")
-    print(f"  轨迹示例(前3维): {full_trajectories[0, :3]}")
+    print(f"  轨迹示例(前6维): {full_trajectories[0, :6]}")
 
     # 构建ACT训练用DataLoader
     traj_train_loader = traj_extractor.make_traj_loader(
@@ -134,7 +139,7 @@ def main():
 
     # =========== Step 6: 训练ACT-Branch ===========
     print("\n[Step 6] 训练ACT-Branch...")
-    act_ckpt_path = os.path.join(cfg.SAVE_DIR, "act_branch.pth")
+    act_ckpt_path = os.path.join(cfg.SAVE_DIR, "act_branch_resnet.pth")
     act_model = ACTBranch(
         traj_dim=cfg.TRAJ_DIM,
         hidden_dim=cfg.ACT_HIDDEN_DIM,
@@ -166,12 +171,12 @@ def main():
 
     # 重新加载统计量（验证save/load一致性）
     traj_stats = TrajectoryStatistics.load(
-        os.path.join(cfg.SAVE_DIR, "traj_stats.pt")
+        os.path.join(cfg.SAVE_DIR, "traj_stats_resnet.pt")
     )
 
     # ID测试集分数
     id_energy = compute_energy_scores(model, test_loader, device)
-    id_traj = compute_traj_scores(
+    id_traj = compute_traj_scores_resnet(
         act_model, model, hook, traj_stats,
         test_loader, device, cfg.TRAJ_LAYERS
     )
@@ -189,7 +194,7 @@ def main():
         print(f"{ood_name:<12} {'Energy':<15} {m1['auroc']:>7.2f}% {m1['fpr95']:>7.2f}% {m1['aupr']:>7.2f}%")
 
         # 轨迹分数
-        ood_traj = compute_traj_scores(
+        ood_traj = compute_traj_scores_resnet(
             act_model, model, hook, traj_stats,
             ood_loader, device, cfg.TRAJ_LAYERS
         )
@@ -197,6 +202,7 @@ def main():
         print(f"{'':.<12} {'Trajectory':<15} {m2['auroc']:>7.2f}% {m2['fpr95']:>7.2f}% {m2['aupr']:>7.2f}%")
 
         # 融合分数
+        from evaluation.scoring import compute_fused_scores
         id_fused, ood_fused = compute_fused_scores(
             id_energy, id_traj, ood_energy, ood_traj,
             alpha=cfg.FUSION_LAMBDA, beta=1.0 - cfg.FUSION_LAMBDA,
