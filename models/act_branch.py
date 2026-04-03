@@ -19,22 +19,17 @@ class LogitNormLoss(nn.Module):
     def forward(self, logits, targets):
         # L2归一化logits
         norms = torch.norm(logits, p=2, dim=1, keepdim=True) + 1e-7
-        logits_norm = logits / norms * (1.0 / self.tau)
+        logits_norm = logits / (norms * self.tau)
         return F.cross_entropy(logits_norm, targets)
 
 
 class ACTBranch(nn.Module):
-    """轨迹判别网络
-
-    结构: Linear -> ReLU -> Dropout -> Linear
-    训练时用LogitNorm损失
-    推理时用energy score (logsumexp)
-    """
-    def __init__(self, traj_dim=36, hidden_dim=64, num_classes=10):
+    """2层MLP: traj_dim -> hidden_dim -> num_classes"""
+    def __init__(self, traj_dim=36, hidden_dim=128, num_classes=10):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(traj_dim, hidden_dim),
-            nn.ReLU(),
+            nn.ReLU(inplace=True),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, num_classes)
         )
@@ -42,11 +37,7 @@ class ACTBranch(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-    @torch.no_grad()
     def get_energy(self, x):
-        """推理时计算energy score
-        Energy = logsumexp(logits)
-        ID样本energy高, OOD样本energy低
-        """
+        """计算energy score: logsumexp(logits)"""
         logits = self.forward(x)
         return torch.logsumexp(logits, dim=1)

@@ -32,14 +32,14 @@ TRAJ_LAYERS = list(range(12))  # 全部12层
 FEAT_DIM = 384  # DeiT-Small hidden dim
 NUM_SIGNALS = 3  # L2范数, 余弦相似度, 马氏距离
 TRAJ_DIM = len(TRAJ_LAYERS) * NUM_SIGNALS  # 12 * 3 = 36
-SHRINKAGE = 0.1  # 协方差矩阵正则化系数
+SHRINKAGE = 0.0005  # 协方差矩阵正则化系数
 
 # ============ ACT-Branch ============
-ACT_EPOCHS = 50
+ACT_EPOCHS = 100         # 50 -> 100
 ACT_LR = 1e-3
-ACT_HIDDEN_DIM = 64
+ACT_HIDDEN_DIM = 128     # 64 -> 128
 ACT_WEIGHT_DECAY = 1e-4
 LOGITNORM_TAU = 0.04
 
 # ============ 评分融合 ============
-FUSION_LAMBDA = 0.5  # energy与trajectory的融合权重
+FUSION_LAMBDA = 0.7  # energy与trajectory的融合权重
