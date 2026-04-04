@@ -23,10 +23,10 @@ from datasets.loader import get_cifar10_loaders, get_ood_loader
 from models.resnet_backbone import ResNetBackbone
 from models.resnet_hook import ResNetHook
 from models.act_branch import ACTBranch
-from trajectory.extractor_resnet import TrajectoryExtractor, TrajectoryStatistics
+from trajectory.extractor_resnet import TrajectoryExtractorResNet, TrajectoryStatisticsResNet
 from trainers.finetune_resnet import finetune
 from trainers.train_act import train_act_branch
-from evaluation.scoring import compute_energy_scores, compute_traj_scores_resnet
+from evaluation.scoring import compute_energy_scores, compute_traj_scores, compute_fused_scores
 from evaluation.metrics import compute_all_metrics
 
 
@@ -55,7 +55,7 @@ def main():
 
     # =========== Step 2: 加载ResNet18 ===========
     print("\n[Step 2] 加载ResNet18预训练模型...")
-    model = ResNet18Backbone(num_classes=cfg.NUM_CLASSES, freeze_backbone=True)
+    model = ResNetBackbone(num_classes=cfg.NUM_CLASSES, freeze_backbone=True)
     model.to(device)
     print(f"  特征维度: {model.feat_dim}")
     print(f"  各层维度: {cfg.LAYER_DIMS}")
@@ -98,13 +98,13 @@ def main():
 
     # 5.1 提取逐层特征和L2范数
     print("  [5.1] 提取逐层特征和L2范数...")
-    traj_extractor = TrajectoryExtractor(model, hook, device)
+    traj_extractor = TrajectoryExtractorResNet(model, hook, device)
     l2_trajectories, labels, all_features = traj_extractor.extract_dataset(train_loader)
     print(f"  L2轨迹形状: {l2_trajectories.shape}")  # [N, 4]
 
     # 5.2 拟合类级统计量（均值+协方差逆）
     print("  [5.2] 拟合类级统计量...")
-    traj_stats = TrajectoryStatistics(
+    traj_stats = TrajectoryStatisticsResNet(
         num_classes=cfg.NUM_CLASSES,
         n_layers=len(cfg.TRAJ_LAYERS),
         layer_dims=cfg.LAYER_DIMS
@@ -170,13 +170,13 @@ def main():
     print("=" * 70)
 
     # 重新加载统计量（验证save/load一致性）
-    traj_stats = TrajectoryStatistics.load(
+    traj_stats = TrajectoryStatisticsResNet.load(
         os.path.join(cfg.SAVE_DIR, "traj_stats_resnet.pt")
     )
 
     # ID测试集分数
     id_energy = compute_energy_scores(model, test_loader, device)
-    id_traj = compute_traj_scores_resnet(
+    id_traj = compute_traj_scores(
         act_model, model, hook, traj_stats,
         test_loader, device, cfg.TRAJ_LAYERS
     )
@@ -194,7 +194,7 @@ def main():
         print(f"{ood_name:<12} {'Energy':<15} {m1['auroc']:>7.2f}% {m1['fpr95']:>7.2f}% {m1['aupr']:>7.2f}%")
 
         # 轨迹分数
-        ood_traj = compute_traj_scores_resnet(
+        ood_traj = compute_traj_scores(
             act_model, model, hook, traj_stats,
             ood_loader, device, cfg.TRAJ_LAYERS
         )
@@ -202,7 +202,6 @@ def main():
         print(f"{'':.<12} {'Trajectory':<15} {m2['auroc']:>7.2f}% {m2['fpr95']:>7.2f}% {m2['aupr']:>7.2f}%")
 
         # 融合分数
-        from evaluation.scoring import compute_fused_scores
         id_fused, ood_fused = compute_fused_scores(
             id_energy, id_traj, ood_energy, ood_traj,
             alpha=cfg.FUSION_LAMBDA, beta=1.0 - cfg.FUSION_LAMBDA,

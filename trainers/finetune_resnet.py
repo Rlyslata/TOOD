@@ -35,8 +35,9 @@ def finetune(model, train_loader, device, epochs=10, lr=1e-3, weight_decay=1e-4)
 
             # backbone冻结，不计算梯度
             with torch.no_grad():
-                features = model.backbone_forward(x)  # [B, 512]
-            
+                logits_detached, features = model(x)  # [B, 10], [B, 512]
+                features = features.detach()
+
             logits = model.classifier(features)
             loss = F.cross_entropy(logits, y)
 

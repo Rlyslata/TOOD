@@ -1,1 +1,1 @@
-from .extractor import TrajectoryExtractorResNet  
+from .extractor_resnet import TrajectoryExtractorResNet, TrajectoryStatisticsResNet

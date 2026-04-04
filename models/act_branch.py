@@ -1,7 +1,7 @@
 """ACT-Branch: 激活轨迹判别模型
 2层MLP + LogitNorm
 
-输入: 36维连续轨迹向量 (12层 x 3信号)
+输入: 12维连续轨迹向量 (4层 x 3信号)
 输出: num_classes维logits
 """
 
@@ -25,7 +25,7 @@ class LogitNormLoss(nn.Module):
 
 class ACTBranch(nn.Module):
     """2层MLP: traj_dim -> hidden_dim -> num_classes"""
-    def __init__(self, traj_dim=36, hidden_dim=128, num_classes=10):
+    def __init__(self, traj_dim=12, hidden_dim=64, num_classes=10):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(traj_dim, hidden_dim),
