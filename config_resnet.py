@@ -37,7 +37,7 @@ FINETUNE_WEIGHT_DECAY = 1e-4
 # ============ 轨迹 ============
 TRAJ_LAYERS = [0, 1, 2, 3]           # ResNet18的4个layer
 LAYER_DIMS = [64, 128, 256, 512]     # 各层特征维度
-NUM_SIGNALS = 3                       # L2范数, 余弦相似度, 马氏距离
+NUM_SIGNALS = 4                       # L2范数, 余弦相似度, 马氏距离
 TRAJ_DIM = len(TRAJ_LAYERS) * NUM_SIGNALS  # 4 * 3 = 12
 SHRINKAGE = 0.001  # 协方差矩阵正则化系数 (维度较小，可用更小的shrinkage)
 

@@ -136,7 +136,22 @@ def main():
     traj_train_loader = traj_extractor.make_traj_loader(
         full_trajectories, labels, batch_size=256, shuffle=True
     )
+    # ===== 在 ACT-Branch 训练前插入 =====
+    print("\n===== 轨迹诊断 =====")
+    # traj_dataset是你的训练轨迹 TensorDataset
+    traj_tensor = full_trajectories   # [N, 12]
+    print(f"shape: {traj_tensor.shape}")
+    print(f"整体: min={traj_tensor.min():.4f}, max={traj_tensor.max():.4f}")
+    print(f"nan: {torch.isnan(traj_tensor).sum()}, inf: {torch.isinf(traj_tensor).sum()}")
 
+    # 逐维统计
+    names = [f"L2_layer{i}" for i in range(4)] + \
+            [f"Cos_layer{i}" for i in range(4)] + \
+            [f"Mahal_layer{i}" for i in range(4)]
+    for j in range(12):
+        col = traj_tensor[:, j]
+        print(f"  dim{j:2d} ({names[j]:12s}): mean={col.mean():12.4f}std={col.std():12.4f}  min={col.min():12.4f}  max={col.max():12.4f}")
+    print("===== 诊断结束 =====\n")
     # =========== Step 6: 训练ACT-Branch ===========
     print("\n[Step 6] 训练ACT-Branch...")
     act_ckpt_path = os.path.join(cfg.SAVE_DIR, "act_branch_resnet.pth")
@@ -180,7 +195,9 @@ def main():
         act_model, model, hook, traj_stats,
         test_loader, device, cfg.TRAJ_LAYERS
     )
-
+    print(f"ID traj score: mean={id_traj.mean():.4f}, std={id_traj.std():.4f}, "
+      f"min={id_traj.min():.4f}, max={id_traj.max():.4f}")
+    
     for ood_name in ["svhn", "textures", "lsun"]:
         ood_loader = get_ood_loader(
             ood_name, cfg.DATA_ROOT, cfg.BATCH_SIZE, cfg.NUM_WORKERS
@@ -198,6 +215,8 @@ def main():
             act_model, model, hook, traj_stats,
             ood_loader, device, cfg.TRAJ_LAYERS
         )
+        print(f"OOD traj score: mean={ood_traj.mean():.4f}, std={ood_traj.std():.4f}, "
+        f"min={ood_traj.min():.4f}, max={ood_traj.max():.4f}")
         m2 = compute_all_metrics(id_traj.numpy(), ood_traj.numpy())
         print(f"{'':.<12} {'Trajectory':<15} {m2['auroc']:>7.2f}% {m2['fpr95']:>7.2f}% {m2['aupr']:>7.2f}%")
 

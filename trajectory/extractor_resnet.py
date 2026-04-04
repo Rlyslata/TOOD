@@ -142,6 +142,36 @@ class TrajectoryStatisticsResNet:
             self.shared_cov_inv[layer] = torch.linalg.inv(cov)  # [C_layer, C_layer]
 
         dims_str = ', '.join([f'layer{i}={layer_feats[l].shape[1]}' for i, l in enumerate(layer_indices)])
+        
+        # ===== 计算轨迹归一化参数 =====
+        print("计算轨迹归一化参数...")
+        all_traj_parts = []
+        batch_size = 512
+        N = labels.shape[0]
+        for offset in range(0, N, batch_size):
+            end = min(offset + batch_size, N)
+            batch_feat = {layer: layer_feats[layer][offset:end] for layer in layer_indices}
+            batch_labels = labels[offset:end]
+
+            # L2
+            batch_l2 = torch.stack(
+                [torch.norm(batch_feat[l], p=2, dim=1) for l in layer_indices], dim=1
+            )
+            # cos + mahal
+            cos = self.compute_cosine_sim(batch_feat, batch_labels, layer_indices)
+            mah = self.compute_mahalanobis(batch_feat, batch_labels, layer_indices)
+            # activation rate
+            act = self._compute_activation_rate(batch_feat, layer_indices)
+
+            traj = torch.cat([batch_l2, cos, mah, act], dim=1)
+            all_traj_parts.append(traj)
+
+        all_traj_tensor = torch.cat(all_traj_parts, dim=0)
+        self.traj_mean = all_traj_tensor.mean(dim=0)
+        self.traj_std = all_traj_tensor.std(dim=0).clamp(min=1e-8)
+        print(f"  归一化参数: mean范围[{self.traj_mean.min():.4f}, {self.traj_mean.max():.4f}], "
+              f"std范围[{self.traj_std.min():.6f}, {self.traj_std.max():.4f}]")
+        
         print(f"  统计量拟合完成: {self.num_classes}类, {len(layer_indices)}层, 维度[{dims_str}]")
 
     def compute_cosine_sim(self, features_dict, pred_labels, layer_indices):
@@ -210,43 +240,55 @@ class TrajectoryStatisticsResNet:
         return mahal  # [B, n_layers]
 
     def build_trajectory(self, features_dict, pred_labels, l2_norms, layer_indices):
-        """
-        拼接完整的12维轨迹向量: [L2, cos_sim, mahalanobis] x 4层
-
-        Args:
-            features_dict: {layer_idx: [B, C_layer]}
-            pred_labels: [B] 预测标签
-            l2_norms: [B, n_layers] L2范数
-            layer_indices: 层索引列表
-
-        Returns:
-            trajectory: [B, n_layers * 3]
-        """
+        """构建归一化后的轨迹向量"""
         cos_sim = self.compute_cosine_sim(features_dict, pred_labels, layer_indices)
         mahal = self.compute_mahalanobis(features_dict, pred_labels, layer_indices)
 
-        # 拼接: [B, 4] x 3 -> [B, 12]
-        trajectory = torch.cat([l2_norms, cos_sim, mahal], dim=1)
+        # 新增: 特征激活率(非零比例)和特征峰度
+        act_rate = self._compute_activation_rate(features_dict, layer_indices)
+        
+        # 拼接: [B,4] x4 = [B,16]
+        trajectory = torch.cat([l2_norms, cos_sim, mahal, act_rate], dim=1)
+
+        # z-score 归一化
+        if hasattr(self, 'traj_mean') and self.traj_mean is not None:
+            trajectory = (trajectory - self.traj_mean.unsqueeze(0)) / self.traj_std.unsqueeze(0)
+
         return trajectory
 
+    def _compute_activation_rate(self, features_dict, layer_indices):
+        """每层特征中0的比例 (ReLU后的激活稀疏度)
+        ID样本通常有稳定的激活率，OOD样本的激活模式会异常
+        """
+        B = features_dict[layer_indices[0]].shape[0]
+        result = torch.zeros(B, len(layer_indices))
+        for i, layer in enumerate(layer_indices):
+            feat = features_dict[layer]
+            if feat.is_cuda:
+                feat = feat.cpu()
+            result[:, i] = (feat > 0).float().mean(dim=1)
+        return result
+
+
     def save(self, path):
-        """保存统计量到文件"""
         state = {
             'num_classes': self.num_classes,
             'n_layers': self.n_layers,
             'layer_dims': self.layer_dims,
             'class_means': self.class_means,
             'shared_cov_inv': self.shared_cov_inv,
+            'traj_mean': getattr(self, 'traj_mean', None),
+            'traj_std': getattr(self, 'traj_std', None),
         }
         torch.save(state, path)
-        print(f"  统计量已保存: {path}")
 
+    
     @classmethod
     def load(cls, path):
-        """从文件加载统计量"""
         state = torch.load(path, map_location='cpu')
         obj = cls(state['num_classes'], state['n_layers'], state['layer_dims'])
         obj.class_means = state['class_means']
         obj.shared_cov_inv = state['shared_cov_inv']
-        print(f"  统计量已加载: {path}")
+        obj.traj_mean = state.get('traj_mean', None)
+        obj.traj_std = state.get('traj_std', None)
         return obj
